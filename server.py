@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify
 import json
 from datetime import datetime
 from uuid import uuid4
-
+import os
 app = Flask(__name__)
 
 CONFIG_PATH = 'config.json'
@@ -77,4 +77,7 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(port=4242)
+
+
+app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 4242)))
+
