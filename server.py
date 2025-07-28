@@ -8,11 +8,6 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 app = Flask(__name__)
 
-# DEBUG: log all registered routes on startup
-logging.basicConfig(level=logging.INFO)
-for rule in app.url_map.iter_rules():
-    logging.info(f"Route: {rule} -> methods={list(rule.methods)}")
-
 @app.route("/")
 def root():
     return "Stripe Render Server is running!"
@@ -29,8 +24,8 @@ def product_catalog():
             "unit_amount": price.unit_amount,
             "currency": price.currency,
             "product": {
-                "id": prod.id,
-                "name": prod.name,
+                "id":          prod.id,
+                "name":        prod.name,
                 "description": prod.description,
             }
         })
@@ -51,6 +46,12 @@ def create_checkout_session():
     )
     return jsonify({"url": session.url})
 
+# DEBUG: log all registered routes _after_ defining them
+logging.basicConfig(level=logging.INFO)
+for rule in app.url_map.iter_rules():
+    logging.info(f"Route: {rule} -> methods={list(rule.methods)}")
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
