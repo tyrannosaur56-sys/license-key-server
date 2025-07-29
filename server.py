@@ -1,3 +1,4 @@
+
 import os
 import logging
 from flask import Flask, jsonify, request
@@ -8,9 +9,13 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 app = Flask(__name__)
 
+@app.route("/")
+def root():
+    return "Stripe server is running"
+
 @app.route("/product-catalog", methods=["GET"])
 def product_catalog():
-    # List active products and prices, expanding each price's product object
+    # List active products and prices
     products = stripe.Product.list(active=True).data
     prices = stripe.Price.list(active=True, expand=["data.product"]).data
 
@@ -30,38 +35,15 @@ def product_catalog():
 
     return jsonify(catalog)
 
-@app.route("/create-checkout-session", methods=["GET", "POST"])
+@app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
-    if request.method == "GET":
-        return '''
-        <html>
-            <body>
-                <h3>Stripe Checkout Test</h3>
-                <form action="/create-checkout-session" method="post">
-                    Price ID: <input type="text" name="priceId" /><br/>
-                    Quantity: <input type="number" name="quantity" value="1" /><br/>
-                    <button type="submit">Create Checkout Session</button>
-                </form>
-            </body>
-        </html>
-        '''
-
-    # POST request
-    try:
-        data = request.get_json(force=True)
-        price_id = data.get("priceId")
-        quantity = data.get("quantity", 1)
-    except Exception:
-        # fallback if form submitted via browser
-        price_id = request.form.get("priceId")
-        quantity = int(request.form.get("quantity", 1))
-
+    data = request.get_json(force=True)
+    price_id = data.get("priceId")
+    quantity = data.get("quantity", 1)
     domain = os.getenv("DOMAIN", "").rstrip("/")
 
-    # Retrieve the Price to detect whether it's recurring
+    # Detect whether it's recurring
     price_obj = stripe.Price.retrieve(price_id)
-
-    # Choose checkout mode based on whether the price is recurring
     if hasattr(price_obj, "recurring") and price_obj.recurring:
         mode = "subscription"
     else:
@@ -75,10 +57,31 @@ def create_checkout_session():
         }],
         mode=mode,
         success_url=f"{domain}/success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{domain}/cancel",
+        cancel_url=f"{domain}/cancel"
     )
 
     return jsonify({"url": session.url})
+
+@app.route("/webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature")
+    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, endpoint_secret
+        )
+    except ValueError:
+        return "Invalid payload", 400
+    except stripe.error.SignatureVerificationError:
+        return "Invalid signature", 400
+
+    if event["type"] == "payment_intent.succeeded":
+        payment_intent = event["data"]["object"]
+        print(f"💰 Payment for {payment_intent['amount']} succeeded!")
+
+    return jsonify(success=True)
 
 # DEBUG: after defining all routes, log them
 logging.basicConfig(level=logging.INFO)
@@ -88,4 +91,3 @@ for rule in app.url_map.iter_rules():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
