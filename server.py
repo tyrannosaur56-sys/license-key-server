@@ -1,23 +1,31 @@
 
 import os
 import logging
+
 from flask import Flask, jsonify, request
 import stripe
 
-# Load your Stripe secret key from the environment
+# ─── Load your Stripe secret key ──────────────────────────────────────────────
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 app = Flask(__name__)
 
-@app.route("/")
-def root():
-    return "Stripe server is running"
 
-@app.route("/product-catalog", methods=["GET"])
+@app.route("/", methods=["HEAD", "GET", "OPTIONS"])
+def root():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/product-catalog", methods=["HEAD", "GET", "OPTIONS"])
 def product_catalog():
-    # List active products and prices
-    products = stripe.Product.list(active=True).data
-    prices = stripe.Price.list(active=True, expand=["data.product"]).data
+    """
+    List all active Prices (and their Product metadata) so
+    your frontend can render a catalog or pricing table.
+    """
+    prices = stripe.Price.list(
+        active=True,
+        expand=["data.product"]
+    ).data
 
     catalog = []
     for price in prices:
@@ -27,66 +35,78 @@ def product_catalog():
             "unit_amount": price.unit_amount,
             "currency": price.currency,
             "product": {
-                "id": prod.id,
-                "name": prod.name,
+                "id":    prod.id,
+                "name":  prod.name,
                 "description": prod.description,
             }
         })
 
     return jsonify(catalog)
 
-@app.route("/create-checkout-session", methods=["POST"])
+
+@app.route("/create-checkout-session", methods=["POST", "OPTIONS"])
 def create_checkout_session():
+    """
+    Create a Checkout Session for either one-time or subscription
+    purchases, depending on the Price’s `recurring` attribute.
+    Frontend posts JSON:
+      { "priceId": "...", "quantity": 1 }
+    """
     data = request.get_json(force=True)
     price_id = data.get("priceId")
     quantity = data.get("quantity", 1)
-    domain = os.getenv("DOMAIN", "").rstrip("/")
+    domain   = os.getenv("DOMAIN", "").rstrip("/")
 
-    # Detect whether it's recurring
+    # Retrieve the Price object so we know if it’s a subscription
     price_obj = stripe.Price.retrieve(price_id)
-    if hasattr(price_obj, "recurring") and price_obj.recurring:
-        mode = "subscription"
-    else:
-        mode = "payment"
+    mode = "subscription" if getattr(price_obj, "recurring", None) else "payment"
 
     session = stripe.checkout.Session.create(
         payment_method_types=["card"],
-        line_items=[{
-            "price": price_id,
-            "quantity": quantity
-        }],
         mode=mode,
+        line_items=[{"price": price_id, "quantity": quantity}],
         success_url=f"{domain}/success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{domain}/cancel"
+        cancel_url =f"{domain}/cancel",
     )
-
     return jsonify({"url": session.url})
 
-@app.route("/webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature")
-    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
+@app.route("/webhook", methods=["POST", "OPTIONS"])
+def webhook_received():
+    """
+    A simple catch‐all webhook endpoint.
+    Right now signature verification is OFF so curl/raw posts will hit it.
+    Later, set STRIPE_WEBHOOK_SECRET and use stripe.Webhook.construct_event().
+    """
+    payload = request.get_data(as_text=True)
+    # If you want signature verification, uncomment below:
+    # sig_header = request.headers.get("Stripe-Signature", "")
+    # webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+    # try:
+    #     event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+    # except Exception as e:
+    #     return jsonify({"error": str(e)}), 400
+    # data = event["data"]["object"]
+
+    # For now just parse JSON and log it
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, endpoint_secret
-        )
-    except ValueError:
-        return "Invalid payload", 400
-    except stripe.error.SignatureVerificationError:
-        return "Invalid signature", 400
+        event = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Invalid payload"}), 400
 
-    if event["type"] == "payment_intent.succeeded":
-        payment_intent = event["data"]["object"]
-        print(f"💰 Payment for {payment_intent['amount']} succeeded!")
+    t = event.get("type")
+    logging.info(f"▶ Received event: {t}")
+    # Example: if you get `checkout.session.completed`, you can
+    # fulfill the order / generate a license key here.
 
-    return jsonify(success=True)
+    return jsonify({"status": "received"}), 200
 
-# DEBUG: after defining all routes, log them
+
+# ─── Log all registered routes ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 for rule in app.url_map.iter_rules():
-    logging.info(f"Route: {rule} -> methods={list(rule.methods)}")
+    logging.info(f"Route: {rule} → methods={list(rule.methods)}")
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
