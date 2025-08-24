@@ -1,32 +1,25 @@
-
 import os
 import logging
-
 from flask import Flask, jsonify, request
 import stripe
 
-# ─── Load your Stripe secret key ──────────────────────────────────────────────
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+# ====== Config ======
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+DOMAIN = os.getenv("DOMAIN", "").rstrip("/")  # optional; leave blank to use Stripe's default success page
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
+# ====== Health ======
+@app.route("/", methods=["GET", "HEAD", "OPTIONS"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
-@app.route("/", methods=["HEAD", "GET", "OPTIONS"])
-def root():
-    return jsonify({"status": "ok"})
-
-
-@app.route("/product-catalog", methods=["HEAD", "GET", "OPTIONS"])
+# ====== Product catalog (live prices) ======
+@app.route("/product-catalog", methods=["GET", "HEAD", "OPTIONS"])
 def product_catalog():
-    """
-    List all active Prices (and their Product metadata) so
-    your frontend can render a catalog or pricing table.
-    """
-    prices = stripe.Price.list(
-        active=True,
-        expand=["data.product"]
-    ).data
-
+    prices = stripe.Price.list(active=True, expand=["data.product"]).data
     catalog = []
     for price in prices:
         prod = price.product
@@ -35,79 +28,88 @@ def product_catalog():
             "unit_amount": price.unit_amount,
             "currency": price.currency,
             "product": {
-                "id":    prod.id,
-                "name":  prod.name,
+                "id": prod.id,
+                "name": prod.name,
                 "description": prod.description,
-            }
+            },
         })
+    return jsonify(catalog), 200
 
-    return jsonify(catalog)
-
-
+# ====== Create Checkout Session ======
 @app.route("/create-checkout-session", methods=["POST", "OPTIONS"])
 def create_checkout_session():
     """
-    Create a Checkout Session for either one-time or subscription
-    purchases, depending on the Price’s `recurring` attribute.
-    Frontend posts JSON:
-      { "priceId": "...", "quantity": 1 }
+    Body (JSON):
+      { "price_id": "price_xxx", "quantity": 1 }
     """
-    data = request.get_json(force=True)
-    price_id = data.get("priceId")
-    quantity = data.get("quantity", 1)
-    domain   = os.getenv("DOMAIN", "").rstrip("/")
+    data = request.get_json(force=True) if request.data else {}
+    price_id = data.get("price_id") or data.get("priceId")  # support both keys
+    quantity = int(data.get("quantity", 1))
 
-    # Retrieve the Price object so we know if it’s a subscription
+    if not price_id:
+        return jsonify({"error": "price_id is required"}), 400
+
+    # Detect subscription vs one-time from the Price object
     price_obj = stripe.Price.retrieve(price_id)
     mode = "subscription" if getattr(price_obj, "recurring", None) else "payment"
 
-    session = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        mode=mode,
-        line_items=[{"price": price_id, "quantity": quantity}],
-        success_url=f"{domain}/success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url =f"{domain}/cancel",
-    )
-    return jsonify({"url": session.url})
+    success_url = f"{DOMAIN}/success?session_id={{CHECKOUT_SESSION_ID}}" if DOMAIN else None
+    cancel_url = f"{DOMAIN}/cancel" if DOMAIN else None
 
-
-@app.route("/webhook", methods=["POST", "OPTIONS"])
-def webhook_received():
-    """
-    A simple catch‐all webhook endpoint.
-    Right now signature verification is OFF so curl/raw posts will hit it.
-    Later, set STRIPE_WEBHOOK_SECRET and use stripe.Webhook.construct_event().
-    """
-    payload = request.get_data(as_text=True)
-    # If you want signature verification, uncomment below:
-    # sig_header = request.headers.get("Stripe-Signature", "")
-    # webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
-    # try:
-    #     event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
-    # except Exception as e:
-    #     return jsonify({"error": str(e)}), 400
-    # data = event["data"]["object"]
-
-    # For now just parse JSON and log it
     try:
-        event = request.get_json(force=True)
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{"price": price_id, "quantity": quantity}],
+            mode=mode,
+            # If you didn't set DOMAIN, Stripe's own "return to your site" will show;
+            # providing at least success_url is recommended for real flows.
+            **({ "success_url": success_url } if success_url else {}),
+            **({ "cancel_url": cancel_url } if cancel_url else {}),
+        )
+        return jsonify({"url": session.url}), 200
+    except stripe.error.InvalidRequestError as e:
+        app.logger.error(f"Stripe InvalidRequest: {e.user_message or str(e)}")
+        return jsonify({"error": e.user_message or "Stripe invalid request"}), 400
+    except Exception as e:
+        app.logger.exception("Create checkout session failed")
+        return jsonify({"error": "Server error creating checkout"}), 500
+
+# ====== Webhook ======
+@app.route("/webhook", methods=["POST", "OPTIONS"])
+def webhook():
+    payload = request.data
+    sig = request.headers.get("Stripe-Signature", "")
+
+    if not WEBHOOK_SECRET:
+        app.logger.warning("No STRIPE_WEBHOOK_SECRET set; rejecting to avoid spoofing.")
+        return jsonify({"error": "Webhook secret not configured"}), 500
+
+    try:
+        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig, secret=WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError:
+        return "Invalid signature", 400
     except Exception:
-        return jsonify({"error": "Invalid payload"}), 400
+        return "Invalid payload", 400
 
-    t = event.get("type")
-    logging.info(f"▶ Received event: {t}")
-    # Example: if you get `checkout.session.completed`, you can
-    # fulfill the order / generate a license key here.
+    etype = event["type"]
+    app.logger.info(f"▶ Received event: {etype}")
 
-    return jsonify({"status": "received"}), 200
+    # Minimal handlers; expand as needed
+    if etype == "checkout.session.completed":
+        # You can fetch and fulfill here
+        app.logger.info("checkout.session.completed handled")
+    elif etype == "invoice.payment_succeeded":
+        app.logger.info("invoice.payment_succeeded handled")
+    elif etype in ("customer.subscription.deleted", "invoice.payment_failed"):
+        app.logger.info(f"{etype} handled")
 
+    return "", 200
 
-# ─── Log all registered routes ────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
+# ====== Log routes on startup ======
 for rule in app.url_map.iter_rules():
-    logging.info(f"Route: {rule} → methods={list(rule.methods)}")
-
+    app.logger.info(f"Route: {rule} → methods={sorted(list(rule.methods))}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
